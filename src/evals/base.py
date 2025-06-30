@@ -64,7 +64,7 @@ class Evaluator:
     def evaluate(self, model, output_dir=None, overwrite=None, **kwargs):
         # set flag to overwrite metrics
         overwrite = self.eval_cfg.overwrite if overwrite is None else overwrite
-
+        overwrite = True
         # Prepare model for evaluation
         model = self.prepare_model(model)
 
@@ -82,6 +82,8 @@ class Evaluator:
             f"Aggregated evaluations will be summarised in: {summary_file_path}"
         )
         for metric_name, metric_fn in self.metrics.items():
+            print(f"Evaluating metric: {metric_name}")
+            print(f"Metric function: {metric_fn}")
             if not overwrite and metric_name in logs and logs[metric_name]:
                 logger.info(f"Skipping {metric_name}, already evaluated.")
                 if "agg_value" in logs[metric_name]:

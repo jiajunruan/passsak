@@ -2,6 +2,7 @@ import logging
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
+from omegaconf import OmegaConf
 
 from evals.metrics.utils import (
     aggregate_to_1D,
@@ -9,6 +10,7 @@ from evals.metrics.utils import (
     eval_text_similarity,
     run_batchwise_evals,
     tokenwise_vocab_logprobs,
+    passsak
 )
 from evals.metrics.base import unlearning_metric
 
@@ -76,13 +78,24 @@ def probability_w_options(model, **kwargs):
 def rouge(model, **kwargs):
     """Calculate ROUGE metrics and return the aggregated value along with per-index scores."""
     tokenizer = kwargs["tokenizer"]
+    # print("tokenizer:", tokenizer)
     data = kwargs["data"]
+    print("data:", data)
     collator = kwargs["collators"]
+    # print("collator:", collator)
     batch_size = kwargs["batch_size"]
+    # print("batch_size:", batch_size)
     generation_args = kwargs["generation_args"]
+    # print("generation_args:", generation_args)
+    batch_size = 1
     dataloader = DataLoader(data, batch_size=batch_size, collate_fn=collator)
-
+    print("dataloader:", dataloader)
+    
+    passsak(model, tokenizer, dataloader, generation_args)
+    batch_size = 32
+    dataloader = DataLoader(data, batch_size=batch_size, collate_fn=collator)
     fun_args = {"tokenizer": tokenizer, "generation_args": generation_args}
+    # print("fun_args:", fun_args)
     scores_by_index = run_batchwise_evals(
         model,
         dataloader,
@@ -98,6 +111,7 @@ def rouge(model, **kwargs):
         ]
     )
     rouge_values = aggregate_to_1D(rouge_values)
+    print("rouge_values:", rouge_values)
     return {
         "agg_value": np.mean(rouge_values),
         "value_by_index": scores_by_index,
@@ -255,3 +269,6 @@ def extraction_strength(model, **kwargs):
     )
     es_values = aggregate_to_1D(es_values)
     return {"agg_value": np.mean(es_values), "value_by_index": scores_by_index}
+
+
+

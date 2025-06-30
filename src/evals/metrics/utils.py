@@ -248,6 +248,79 @@ def stop_sequences_criteria(
     )
 
 
+def passsak_per_query(model, tokenizer, batch, generation_args):
+    batch = {k: v.to(model.device) for k, v in batch.items()}
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    input_texts = tokenizer.batch_decode(
+        input_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+    )
+    tokens = [label[label != IGNORE_INDEX] for label in labels]
+    full_texts = tokenizer.batch_decode(
+        tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True
+    )
+    ground_truths = [
+        full_text.replace(input_text, "").strip()
+        for input_text, full_text in zip(input_texts, full_texts)
+    ]
+    attention_mask = batch["attention_mask"]
+
+    # 只取第一个样本
+    prompt = input_texts[0]
+    ground_truth = ground_truths[0]
+
+    for i in range(1, 4):
+        multi_prompt = prompt * i
+        multi_input = tokenizer(
+            multi_prompt, return_tensors="pt", padding=True
+        ).to(model.device)
+        # 生成i个输出
+        output = model.generate(
+            multi_input["input_ids"],
+            attention_mask=multi_input["attention_mask"],
+            **OmegaConf.to_container(generation_args, resolve=True),
+            pad_token_id=tokenizer.eos_token_id,
+            num_return_sequences=i
+        )
+        # 先解码所有生成文本
+        all_gen_text = tokenizer.batch_decode(
+            output[:, multi_input["input_ids"].shape[-1]:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )[0]  # 这里只会有一个元素，因为输入只有一个
+        # 去掉前面重复的prompt部分
+        gen_texts = []
+        for j in range(i):
+            start = len(prompt) * j
+            end = len(prompt) * (j + 1)
+            # 取出每个生成的部分
+            gen_text = all_gen_text[start:end]
+            gen_texts.append(gen_text)
+        # 计算ROUGE
+        scorer = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+        for idx, gen_text in enumerate(gen_texts):
+            rouge_scores = scorer.score(ground_truth, gen_text)
+            print(f"i={i}, output {idx+1}: {gen_text}")
+            print(f"ROUGE-1 recall: {rouge_scores['rouge1'].recall:.4f}, ROUGE-L f1: {rouge_scores['rougeL'].fmeasure:.4f}")
+
+
+
+
+def passsak(model, tokenizer, dataloader, generation_args):
+    results = []
+    i=0
+    for batch in dataloader:  # batch_size=1
+        if i >= 2:
+            print("Breaking after 2 batches for testing purposes.")
+            break   
+        else:
+            print(f"Processing batch {i+1}...")
+            result = passsak_per_query(model, tokenizer, batch, generation_args)
+            results.append(result)
+            i += 1
+    return results
+
+
 def eval_text_similarity(model, tokenizer, batch, generation_args):
     """Evaluate text similarity between model-generated outputs and ground truth using ROUGE scores."""
 
@@ -338,3 +411,4 @@ def extract_target_texts_from_processed_data(tokenizer, batch):
         tokenizer.decode(elem.tolist(), skip_special_tokens=True) for elem in labels
     ]
     return texts
+
