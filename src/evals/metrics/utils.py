@@ -249,6 +249,8 @@ def stop_sequences_criteria(
 
 
 def passsak_per_query(model, tokenizer, batch, generation_args):
+    import json
+    """python src/eval.py --config-name=eval.yaml experiment=eval/tofu/default   model=Llama-3.2-1B-Instruct   model.model_args.pretrained_model_name_or_path=open-unlearning/unlearn_tofu_Llama-3.2-1B-Instruct_forget10_GradDiff_lr1e-05_alpha5_epoch10   retain_logs_path=saves/eval/tofu_Llama-3.2-1B-Instruct_retain90/TOFU_EVAL.json"""
     batch = {k: v.to(model.device) for k, v in batch.items()}
     input_ids = batch["input_ids"]
     labels = batch["labels"]
@@ -263,47 +265,84 @@ def passsak_per_query(model, tokenizer, batch, generation_args):
         full_text.replace(input_text, "").strip()
         for input_text, full_text in zip(input_texts, full_texts)
     ]
-    attention_mask = batch["attention_mask"]
-
-    # 只取第一个样本
     prompt = input_texts[0]
     ground_truth = ground_truths[0]
 
-    for i in range(1, 4):
-        multi_prompt = prompt * i
-        multi_input = tokenizer(
-            multi_prompt, return_tensors="pt", padding=True
-        ).to(model.device)
-        # 生成i个输出
-        output = model.generate(
-            multi_input["input_ids"],
-            attention_mask=multi_input["attention_mask"],
-            **OmegaConf.to_container(generation_args, resolve=True),
-            pad_token_id=tokenizer.eos_token_id,
-            num_return_sequences=i
-        )
-        # 先解码所有生成文本
-        all_gen_text = tokenizer.batch_decode(
-            output[:, multi_input["input_ids"].shape[-1]:],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
-        )[0]  # 这里只会有一个元素，因为输入只有一个
-        # 去掉前面重复的prompt部分
-        gen_texts = []
-        for j in range(i):
-            start = len(prompt) * j
-            end = len(prompt) * (j + 1)
-            # 取出每个生成的部分
-            gen_text = all_gen_text[start:end]
-            gen_texts.append(gen_text)
-        # 计算ROUGE
-        scorer = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
-        for idx, gen_text in enumerate(gen_texts):
-            rouge_scores = scorer.score(ground_truth, gen_text)
-            print(f"i={i}, output {idx+1}: {gen_text}")
-            print(f"ROUGE-1 recall: {rouge_scores['rouge1'].recall:.4f}, ROUGE-L f1: {rouge_scores['rougeL'].fmeasure:.4f}")
+    def contains_exact_phrase(response, answer):
+        return answer.strip() in response
 
+    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    results_by_n = {}
+    detailed_results_by_n = {}
 
+    for n in [1, 2, 5, 10, 20]:
+        max_rouge_scores = []
+        detailed_results = []
+
+        prompts = [prompt] * n
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=True).to(model.device)
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=generation_args.get("max_new_tokens", 256),
+                do_sample=True,
+                num_return_sequences=n,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+
+        decoded_outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+        best_response = ""
+        best_rouge_score = -1
+        best_exact_score = 0
+        generation_scores = []
+
+        for gen_text in decoded_outputs:
+            # 去掉prompt部分
+            response_clean = gen_text.split(prompt)[-1].strip() if prompt in gen_text else gen_text.strip()
+            rouge_recall = scorer.score(ground_truth, response_clean)['rougeL'].recall
+            exact_score = 1 if contains_exact_phrase(response_clean, ground_truth) else 0
+
+            generation_scores.append({
+                "response": response_clean,
+                "rougeL_recall": rouge_recall,
+                "exact_match": exact_score
+            })
+
+            if exact_score == 1 and rouge_recall == 1:
+                best_response = response_clean
+                best_rouge_score = rouge_recall
+                best_exact_score = 1
+            elif rouge_recall > best_rouge_score:
+                best_response = response_clean
+                best_rouge_score = rouge_recall
+
+        max_rouge_scores.append(best_rouge_score)
+        detailed_results.append({
+            "prompt": prompt,
+            "ground_truth": ground_truth,
+            "best_response": best_response,
+            "max_rougeL_recall": best_rouge_score,
+            "exact_match_found": bool(best_exact_score),
+            "all_generations": generation_scores
+        })
+
+        mean_rouge = sum(max_rouge_scores) / len(max_rouge_scores)
+        results_by_n[n] = mean_rouge
+        detailed_results_by_n[n] = {
+            "mean_rougeL_recall": mean_rouge,
+            "per_query": detailed_results
+        }
+
+    # 可选：保存结果到文件
+    with open("generations_scores.json", "w") as f:
+        json.dump(results_by_n, f, indent=2)
+    with open("generations_scores_responses.json", "w") as f:
+        json.dump(detailed_results_by_n, f, indent=2)
+
+    return {"results_by_n": results_by_n, "detailed_results_by_n": detailed_results_by_n}
 
 
 def passsak(model, tokenizer, dataloader, generation_args):
