@@ -90,8 +90,19 @@ def rouge(model, **kwargs):
     batch_size = 1
     dataloader = DataLoader(data, batch_size=batch_size, collate_fn=collator)
     print("dataloader:", dataloader)
-    
-    passsak(model, tokenizer, dataloader, generation_args)
+    import time
+    start_time = time.time()
+    for i in range(1):
+        if i == 0:
+            generation_args["temperature"] = 0.1
+        elif i == 1:
+            generation_args["temperature"] = 1
+        else:
+            generation_args["temperature"] = 2
+        print ("starting passsak with temperature:", generation_args["temperature"])
+        passsak(model, tokenizer, dataloader, generation_args)
+    end_time = time.time()
+    print("Time taken for passsak:", end_time - start_time)
     batch_size = 32
     dataloader = DataLoader(data, batch_size=batch_size, collate_fn=collator)
     fun_args = {"tokenizer": tokenizer, "generation_args": generation_args}

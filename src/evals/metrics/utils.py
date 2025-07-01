@@ -10,6 +10,8 @@ import torch
 from transformers import StoppingCriteria, StoppingCriteriaList, PreTrainedTokenizer
 from data.utils import IGNORE_INDEX
 import warnings
+import os
+import json
 
 
 def dict_transpose(evals):
@@ -248,9 +250,45 @@ def stop_sequences_criteria(
     )
 
 
-def passsak_per_query(model, tokenizer, batch, generation_args):
-    import json
-    """python src/eval.py --config-name=eval.yaml experiment=eval/tofu/default   model=Llama-3.2-1B-Instruct   model.model_args.pretrained_model_name_or_path=open-unlearning/unlearn_tofu_Llama-3.2-1B-Instruct_forget10_GradDiff_lr1e-05_alpha5_epoch10   retain_logs_path=saves/eval/tofu_Llama-3.2-1B-Instruct_retain90/TOFU_EVAL.json"""
+def passsak(model, tokenizer, dataloader, generation_args):
+    model_name = getattr(model, "name_or_path", "model")
+    result_dir = os.path.join("result", model_name, "temperature={}".format(generation_args.get("temperature")))
+    os.makedirs(result_dir, exist_ok=True)
+
+    n_list = [1, 2, 5, 10, 20]
+    for n in n_list:
+        with open(os.path.join(result_dir, f"generations_n{n}.json"), "w") as f:
+            pass  
+
+    # for i, batch in enumerate(tqdm(dataloader, desc="Evaluating batches", total=len(dataloader))):
+    #     if i >= 2:
+    #         print("Breaking after 2 batches for testing purposes.")
+    #         break
+    #     else:
+    #         print(f"Processing batch {i+1}...")
+    #         passsak_per_query(model, tokenizer, batch, generation_args, result_dir)
+    #         results.append(1)  
+
+    for batch in tqdm(dataloader, desc="Evaluating batches", total=len(dataloader)):
+        passsak_per_query(model, tokenizer, batch, generation_args, result_dir)
+
+    summary = {}
+    for n in n_list:
+        file_path = os.path.join(result_dir, f"generations_n{n}.json")
+        scores = []
+        with open(file_path, "r") as f:
+            for line in f:
+                data = json.loads(line)
+                scores.append(data["best_answer"]["rougeL_recall"])
+        mean_score = sum(scores) / len(scores) if scores else 0
+        summary[f"generations_n{n}"] = mean_score
+
+    with open(os.path.join(result_dir, "rougeL_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    return summary
+
+def passsak_per_query(model, tokenizer, batch, generation_args, result_dir):
     batch = {k: v.to(model.device) for k, v in batch.items()}
     input_ids = batch["input_ids"]
     labels = batch["labels"]
@@ -269,19 +307,15 @@ def passsak_per_query(model, tokenizer, batch, generation_args):
     ground_truth = ground_truths[0]
 
     def contains_exact_phrase(response, answer):
-        return answer.strip() in response
+        response_clean = response.lower()
+        reference_clean = answer.lower()
+        return reference_clean in response_clean
 
     scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-    results_by_n = {}
-    detailed_results_by_n = {}
 
-    for n in [1, 2, 5, 10, 20]:
-        max_rouge_scores = []
-        detailed_results = []
-
+    for n in [1, 2, 5, 10, 20, 30]:
         prompts = [prompt] * n
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=True).to(model.device)
-
         with torch.no_grad():
             output_ids = model.generate(
                 input_ids=inputs["input_ids"],
@@ -290,74 +324,45 @@ def passsak_per_query(model, tokenizer, batch, generation_args):
                 do_sample=True,
                 num_return_sequences=n,
                 pad_token_id=tokenizer.eos_token_id,
+                top_p=generation_args.get("top_p", 0.9),
+                temperature=generation_args.get("temperature", 0.1),
             )
 
         decoded_outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
-        best_response = ""
-        best_rouge_score = -1
-        best_exact_score = 0
-        generation_scores = []
+        responses = []
+        best_rouge = -1
+        best_idx = -1
 
-        for gen_text in decoded_outputs:
-            # 去掉prompt部分
+        for idx, gen_text in enumerate(decoded_outputs):
             response_clean = gen_text.split(prompt)[-1].strip() if prompt in gen_text else gen_text.strip()
             rouge_recall = scorer.score(ground_truth, response_clean)['rougeL'].recall
             exact_score = 1 if contains_exact_phrase(response_clean, ground_truth) else 0
-
-            generation_scores.append({
+            responses.append({
                 "response": response_clean,
                 "rougeL_recall": rouge_recall,
                 "exact_match": exact_score
             })
+            if rouge_recall > best_rouge:
+                best_rouge = rouge_recall
+                best_idx = idx
 
-            if exact_score == 1 and rouge_recall == 1:
-                best_response = response_clean
-                best_rouge_score = rouge_recall
-                best_exact_score = 1
-            elif rouge_recall > best_rouge_score:
-                best_response = response_clean
-                best_rouge_score = rouge_recall
-
-        max_rouge_scores.append(best_rouge_score)
-        detailed_results.append({
-            "prompt": prompt,
-            "ground_truth": ground_truth,
-            "best_response": best_response,
-            "max_rougeL_recall": best_rouge_score,
-            "exact_match_found": bool(best_exact_score),
-            "all_generations": generation_scores
-        })
-
-        mean_rouge = sum(max_rouge_scores) / len(max_rouge_scores)
-        results_by_n[n] = mean_rouge
-        detailed_results_by_n[n] = {
-            "mean_rougeL_recall": mean_rouge,
-            "per_query": detailed_results
+        best_answer = {
+            "response": responses[best_idx]["response"],
+            "rougeL_recall": responses[best_idx]["rougeL_recall"],
+            "exact_match": responses[best_idx]["exact_match"]
         }
 
-    # 可选：保存结果到文件
-    with open("generations_scores.json", "w") as f:
-        json.dump(results_by_n, f, indent=2)
-    with open("generations_scores_responses.json", "w") as f:
-        json.dump(detailed_results_by_n, f, indent=2)
+        result = {
+            "prompt": prompt,
+            "ground_truth": ground_truth,
+            "responses": responses,
+            "best_answer": best_answer
+        }
 
-    return {"results_by_n": results_by_n, "detailed_results_by_n": detailed_results_by_n}
-
-
-def passsak(model, tokenizer, dataloader, generation_args):
-    results = []
-    i=0
-    for batch in dataloader:  # batch_size=1
-        if i >= 2:
-            print("Breaking after 2 batches for testing purposes.")
-            break   
-        else:
-            print(f"Processing batch {i+1}...")
-            result = passsak_per_query(model, tokenizer, batch, generation_args)
-            results.append(result)
-            i += 1
-    return results
+        with open(os.path.join(result_dir, f"generations_n{n}.json"), "a") as f:
+            json.dump(result, f, ensure_ascii=False)
+            f.write("\n")
 
 
 def eval_text_similarity(model, tokenizer, batch, generation_args):
