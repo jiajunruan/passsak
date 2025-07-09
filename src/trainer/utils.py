@@ -3,6 +3,8 @@ import random
 import numpy as np
 from torch import nn
 import torch.nn.functional as F
+import json
+import os
 
 
 def seed_everything(seed=42):
@@ -18,7 +20,6 @@ def compute_kl_divergence(model, target_model, inputs):
     with torch.no_grad():
         ref_outputs = target_model(**inputs)
 
-    ref_probs = F.log_softmax(ref_outputs.logits, dim=-1)
     ref_probs = F.log_softmax(ref_outputs.logits, dim=-1)
     ref_probs = ref_probs.view(-1, ref_outputs.logits.shape[-1])
 
@@ -44,28 +45,102 @@ def compute_batch_nll(model, inputs):
     loss = loss_function(logits.transpose(-1, -2), shifted_labels).sum(dim=-1)
     return loss, outputs
 
+from torch.distributions import Categorical
+
+def compute_entropy_loss(model, inputs):
+    """Compute the entropy of the model's predictions for given inputs."""
+    outputs = model(**inputs)
+    logits = outputs.logits  # [batch_size, seq_len, vocab_size]
+    labels = inputs["labels"]
+    
+    # Align logits and labels
+    shifted_labels = labels[..., 1:].contiguous()
+    logits = logits[..., :-1, :].contiguous()
+    
+    # Compute probabilities
+    probs = torch.softmax(logits, dim=-1)
+    
+    # Calculate entropy per token, then average over sequence
+    entropy = Categorical(probs=probs).entropy()  # [batch_size, seq_len-1]
+    avg_entropy = entropy.mean(dim=-1)  # [batch_size]
+    
+    return avg_entropy.mean()  # scalar
 
 def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=1.0):
+    """
+    Compute DPO loss with optional entropy minimization for lose_inputs (forget set).
+    """
     if win_inputs is None and lose_inputs is None:
         raise ValueError("Both win_inputs and lose_inputs can't be None")
 
     win_log_ratio, lose_log_ratio = 0.0, 0.0
     win_outputs, lose_outputs = None, None
+    entropy_loss = 0.0
 
+    # Compute win terms (retain set)
     if win_inputs is not None:
         win_loss, win_outputs = compute_batch_nll(model, win_inputs)
         with torch.no_grad():
             win_ref_loss, _ = compute_batch_nll(ref_model, win_inputs)
         win_log_ratio = -(win_loss - win_ref_loss)
 
+    # Compute lose terms (forget set)
     if lose_inputs is not None:
         lose_loss, lose_outputs = compute_batch_nll(model, lose_inputs)
         with torch.no_grad():
             lose_ref_loss, _ = compute_batch_nll(ref_model, lose_inputs)
         lose_log_ratio = -(lose_loss - lose_ref_loss)
+        
+        # Add entropy minimization for forget set
+        entropy_loss = compute_entropy_loss(model, lose_inputs)
 
-    loss = -2 / beta * F.logsigmoid(beta * (win_log_ratio - lose_log_ratio)).mean()
-    return loss, (win_outputs, lose_outputs)
+    # Original DPO loss
+    dpo_loss = -2 / beta * F.logsigmoid(beta * (win_log_ratio - lose_log_ratio)).mean()
+    
+    # Combined loss: DPO + entropy minimization for forget set
+    entropy_weight = 0.25  # Adjust this weight as needed
+    total_loss = dpo_loss + entropy_weight * entropy_loss
+
+    print(f"Total Loss: {total_loss.item()}, DPO Loss: {dpo_loss.item()}, Entropy Loss: {entropy_loss.item()}")
+
+    result = {
+        "total_loss": float(total_loss.item()),
+        "dpo_loss": float(dpo_loss.item()),
+        "entropy_loss": float(entropy_loss.item())
+    }
+    json_path = "loss_log.json"
+    if os.path.exists(json_path):
+        with open(json_path, "r") as f:
+            data = json.load(f)
+    else:
+        data = []
+    data.append(result)
+    with open(json_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    return total_loss, (win_outputs, lose_outputs)
+
+# def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=1.0):
+#     if win_inputs is None and lose_inputs is None:
+#         raise ValueError("Both win_inputs and lose_inputs can't be None")
+
+#     win_log_ratio, lose_log_ratio = 0.0, 0.0
+#     win_outputs, lose_outputs = None, None
+
+#     if win_inputs is not None:
+#         win_loss, win_outputs = compute_batch_nll(model, win_inputs)
+#         with torch.no_grad():
+#             win_ref_loss, _ = compute_batch_nll(ref_model, win_inputs)
+#         win_log_ratio = -(win_loss - win_ref_loss)
+
+#     if lose_inputs is not None:
+#         lose_loss, lose_outputs = compute_batch_nll(model, lose_inputs)
+#         with torch.no_grad():
+#             lose_ref_loss, _ = compute_batch_nll(ref_model, lose_inputs)
+#         lose_log_ratio = -(lose_loss - lose_ref_loss)
+
+#     loss = -2 / beta * F.logsigmoid(beta * (win_log_ratio - lose_log_ratio)).mean()
+#     return loss, (win_outputs, lose_outputs)
 
 
 def compute_undial_loss(model, ref_model, inputs, beta):
