@@ -12,6 +12,7 @@ from data.utils import IGNORE_INDEX
 import warnings
 import os
 import json
+from torch.nn import functional as F
 
 
 def dict_transpose(evals):
@@ -253,9 +254,10 @@ def stop_sequences_criteria(
 def passsak(model, tokenizer, dataloader, generation_args):
     model_name = getattr(model, "name_or_path", "model")
     result_dir = os.path.join("result", model_name, "temperature={}".format(generation_args.get("temperature")))
+    print(f"Saving results to {result_dir}")
     os.makedirs(result_dir, exist_ok=True)
 
-    n_list = [1, 2, 5, 10, 20]
+    n_list = [1, 2, 5, 10, 20, 30]
     for n in n_list:
         with open(os.path.join(result_dir, f"generations_n{n}.json"), "w") as f:
             pass  
@@ -288,6 +290,80 @@ def passsak(model, tokenizer, dataloader, generation_args):
 
     return summary
 
+def generate_with_adaptive_temperature(
+    model, 
+    tokenizer, 
+    prompt_ids, 
+    generation_args,
+    cT=0.9 # Confidence threshold for adaptive temperature
+):
+    """
+    Generates a single text sequence token-by-token using adaptive temperature scaling.
+    """
+    # Get parameters from generation_args
+    max_new_tokens = generation_args.get("max_new_tokens", 256)
+    normal_temp = generation_args.get("temperature", 0.1)
+    top_p = generation_args.get("top_p", 0.9)
+    eos_token_id = tokenizer.eos_token_id
+
+    generated_ids = prompt_ids
+    confidence_history = []
+    confidence = 0
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            # 1. Get model's probability distribution (logits) for the next token
+            outputs = model(input_ids=generated_ids)
+            next_token_logits = outputs.logits[:, -1, :]
+
+            # 2. Calculate the current confidence
+            #    First, get the probability of the most likely token
+            next_token_probs = F.softmax(next_token_logits, dim=-1)
+            most_likely_token_prob = torch.max(next_token_probs).item()
+            confidence_history.append(most_likely_token_prob)
+            current_confidence = sum(confidence_history) / len(confidence_history)
+
+            # 3. Adaptively adjust the temperature
+            if current_confidence > cT:
+                temperature = 0.0  # Force greedy decoding
+                
+            else:
+                temperature = normal_temp
+
+            # 4. Sample the next token based on the temperature
+            if temperature == 0.0:
+                confidence += 1
+                # If temperature is 0, choose the token with the highest probability
+                next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+            else:
+                # Apply top-p and temperature for sampling
+                # a. Apply temperature scaling
+                scaled_logits = next_token_logits / temperature
+                
+                # b. Apply Top-p (Nucleus Sampling)
+                sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                scaled_logits[:, indices_to_remove] = -float('Inf')
+                
+                # c. Sample from the modified distribution
+                probs = F.softmax(scaled_logits, dim=-1)
+                next_token_id = torch.multinomial(probs, num_samples=1)
+
+            # 5. Append the newly generated token to the sequence
+            generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
+
+            # Check if the end-of-sequence token was generated
+            if next_token_id.item() == eos_token_id:
+                print(f"Generated EOS token after {confidence} tokens.")
+                break
+                
+    return generated_ids
+
 def passsak_per_query(model, tokenizer, batch, generation_args, result_dir):
     batch = {k: v.to(model.device) for k, v in batch.items()}
     input_ids = batch["input_ids"]
@@ -312,24 +388,43 @@ def passsak_per_query(model, tokenizer, batch, generation_args, result_dir):
         return reference_clean in response_clean
 
     scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-
+    adaptive_tmp = True
     for n in [1, 2, 5, 10, 20, 30]:
-        prompts = [prompt] * n
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=True).to(model.device)
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=generation_args.get("max_new_tokens", 256),
-                do_sample=True,
-                num_return_sequences=n,
-                pad_token_id=tokenizer.eos_token_id,
-                top_p=generation_args.get("top_p", 0.9),
-                temperature=generation_args.get("temperature", 0.1),
-            )
+        
+        # Check the generation_args dictionary for the 'adaptive_tmp' flag
+        if adaptive_tmp == True:
+            # --- IF TRUE: Use the new adaptive temperature method ---
+            prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+            output_ids_list = []
+            for _ in range(n):
+                output_ids = generate_with_adaptive_temperature(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_ids=prompt_ids,
+                    generation_args=generation_args,
+                    cT=generation_args.get("cT", 0.9) # Get cT from args, default to 0.9
+                )
+                output_ids_list.append(output_ids[0])
+            decoded_outputs = tokenizer.batch_decode(output_ids_list, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        
+        else:
+            # --- ELSE: Use your original code with model.generate ---
+            prompts = [prompt] * n
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=True).to(model.device)
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=generation_args.get("max_new_tokens", 256),
+                    do_sample=True,
+                    num_return_sequences=n,
+                    pad_token_id=tokenizer.eos_token_id,
+                    top_p=generation_args.get("top_p", 0.9),
+                    temperature=generation_args.get("temperature", 0.1),
+                )
+            decoded_outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
-        decoded_outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-
+        # --- The rest of the evaluation code remains the same ---
         responses = []
         best_rouge = -1
         best_idx = -1
@@ -347,11 +442,14 @@ def passsak_per_query(model, tokenizer, batch, generation_args, result_dir):
                 best_rouge = rouge_recall
                 best_idx = idx
 
+        if best_idx == -1 and responses:
+            best_idx = 0
+
         best_answer = {
             "response": responses[best_idx]["response"],
             "rougeL_recall": responses[best_idx]["rougeL_recall"],
             "exact_match": responses[best_idx]["exact_match"]
-        }
+        } if best_idx != -1 else {"response": "", "rougeL_recall": 0, "exact_match": 0}
 
         result = {
             "prompt": prompt,
@@ -363,6 +461,82 @@ def passsak_per_query(model, tokenizer, batch, generation_args, result_dir):
         with open(os.path.join(result_dir, f"generations_n{n}.json"), "a") as f:
             json.dump(result, f, ensure_ascii=False)
             f.write("\n")
+
+# def passsak_per_query(model, tokenizer, batch, generation_args, result_dir):
+#     batch = {k: v.to(model.device) for k, v in batch.items()}
+#     input_ids = batch["input_ids"]
+#     labels = batch["labels"]
+#     input_texts = tokenizer.batch_decode(
+#         input_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+#     )
+#     tokens = [label[label != IGNORE_INDEX] for label in labels]
+#     full_texts = tokenizer.batch_decode(
+#         tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True
+#     )
+#     ground_truths = [
+#         full_text.replace(input_text, "").strip()
+#         for input_text, full_text in zip(input_texts, full_texts)
+#     ]
+#     prompt = input_texts[0]
+#     ground_truth = ground_truths[0]
+
+#     def contains_exact_phrase(response, answer):
+#         response_clean = response.lower()
+#         reference_clean = answer.lower()
+#         return reference_clean in response_clean
+
+#     scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+
+#     for n in [1, 2, 5, 10, 20, 30]:
+#         prompts = [prompt] * n
+#         inputs = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=True).to(model.device)
+#         with torch.no_grad():
+#             output_ids = model.generate(
+#                 input_ids=inputs["input_ids"],
+#                 attention_mask=inputs["attention_mask"],
+#                 max_new_tokens=generation_args.get("max_new_tokens", 256),
+#                 do_sample=True,
+#                 num_return_sequences=n,
+#                 pad_token_id=tokenizer.eos_token_id,
+#                 top_p=generation_args.get("top_p", 0.9),
+#                 temperature=generation_args.get("temperature", 0.1),
+#             )
+
+#         decoded_outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+#         responses = []
+#         best_rouge = -1
+#         best_idx = -1
+
+#         for idx, gen_text in enumerate(decoded_outputs):
+#             response_clean = gen_text.split(prompt)[-1].strip() if prompt in gen_text else gen_text.strip()
+#             rouge_recall = scorer.score(ground_truth, response_clean)['rougeL'].recall
+#             exact_score = 1 if contains_exact_phrase(response_clean, ground_truth) else 0
+#             responses.append({
+#                 "response": response_clean,
+#                 "rougeL_recall": rouge_recall,
+#                 "exact_match": exact_score
+#             })
+#             if rouge_recall > best_rouge:
+#                 best_rouge = rouge_recall
+#                 best_idx = idx
+
+#         best_answer = {
+#             "response": responses[best_idx]["response"],
+#             "rougeL_recall": responses[best_idx]["rougeL_recall"],
+#             "exact_match": responses[best_idx]["exact_match"]
+#         }
+
+#         result = {
+#             "prompt": prompt,
+#             "ground_truth": ground_truth,
+#             "responses": responses,
+#             "best_answer": best_answer
+#         }
+
+#         with open(os.path.join(result_dir, f"generations_n{n}.json"), "a") as f:
+#             json.dump(result, f, ensure_ascii=False)
+#             f.write("\n")
 
 
 def eval_text_similarity(model, tokenizer, batch, generation_args):

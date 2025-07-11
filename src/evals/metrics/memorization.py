@@ -92,9 +92,10 @@ def rouge(model, **kwargs):
     print("dataloader:", dataloader)
     import time
     start_time = time.time()
-    for i in range(1):
+    for i in range(3):
         if i == 0:
             generation_args["temperature"] = 0.1
+            continue
         elif i == 1:
             generation_args["temperature"] = 1
         else:

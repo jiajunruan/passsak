@@ -1,7 +1,7 @@
 import hydra
 from omegaconf import DictConfig
 
-from trainer.utils import seed_everything
+# from trainer.utils import seed_everything
 from model import get_model
 from evals import get_evaluators
 
@@ -12,7 +12,7 @@ def main(cfg: DictConfig):
     Args:
         cfg (DictConfig): Config to train
     """
-    seed_everything(cfg.seed)
+    # seed_everything(cfg.seed)
     model_cfg = cfg.model
     template_args = model_cfg.template_args
     assert model_cfg is not None, "Invalid model yaml passed in train config."

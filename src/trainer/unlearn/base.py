@@ -32,7 +32,8 @@ else:
     IS_SAGEMAKER_MP_POST_1_10 = False
 
 if is_deepspeed_available():
-    import deepspeed
+    # import deepspeed
+    1
 
 
 class UnlearnTrainer(FinetuneTrainer):
